@@ -1,31 +1,35 @@
 """Finance calculations for FinanceLens (no Streamlit code here, so it is easy to test)."""
 import pandas as pd
 
+NUMBERS = ["Revenue", "Operating Profit", "Net Profit", "Total Equity"]
 
-def load_data(path="data.csv"):
-    """Read the company numbers (₹ crore, FY26) and add the three ratios."""
-    df = pd.read_csv(path).set_index("Company")
+
+def load_verified(path="data.csv"):
+    """FY26 numbers (₹ crore) that were checked by hand, one row per company."""
+    return pd.read_csv(path).set_index("Company")
+
+
+def add_ratios(df):
+    """Add the three ratios to a table that has the four NUMBERS columns."""
+    df = df.copy()
     df["Operating margin"] = df["Operating Profit"] / df["Revenue"]
     df["Net margin"] = df["Net Profit"] / df["Revenue"]
     df["ROE"] = df["Net Profit"] / df["Total Equity"]
     return df
 
 
-def peer_average(df, company, column):
-    """Average of a ratio across the company's sector peers.
-    If the company has no peers in the data, use all companies instead."""
-    sector = df.loc[company, "Sector"]
-    group = df[df["Sector"] == sector]
-    if len(group) < 2:
-        return df[column].mean(), "all companies"
-    return group[column].mean(), "sector peers"
-
-
 def pe_ratio(market_cap_cr, net_profit_cr):
     """P/E = market value of the company ÷ its yearly profit (both in ₹ crore)."""
-    if not market_cap_cr or not net_profit_cr:
+    if not market_cap_cr or not net_profit_cr or net_profit_cr <= 0:
         return None
     return market_cap_cr / net_profit_cr
+
+
+def pb_ratio(market_cap_cr, equity_cr):
+    """P/B = market value of the company ÷ shareholders' equity."""
+    if not market_cap_cr or not equity_cr or equity_cr <= 0:
+        return None
+    return market_cap_cr / equity_cr
 
 
 # ---------------- Practice portfolio (fake money) ----------------

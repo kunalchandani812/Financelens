@@ -1,6 +1,6 @@
 # FinanceLens
 
-A stock market simulator: buy and sell Indian stocks with fake money at real (delayed) prices. A Research tab explains ratios for six companies.
+A stock market simulator: buy and sell Indian stocks with fake money at real (delayed) prices. Companies are grouped into 8 sectors with 5 companies each. A Research tab compares them by sector and a Learn tab explains each company.
 
 ## Run it on your computer
 1. Install Python 3.10 or newer.
@@ -15,8 +15,8 @@ A stock market simulator: buy and sell Indian stocks with fake money at real (de
 Buy and sell with fake money at real, delayed prices. The account lives in the browser session, so it resets when the page is refreshed; use the download button to keep a record. Saving accounts and a leaderboard would need a database and logins (next step).
 
 ## Files
-- `stocks.csv`: every stock you can trade (name and Yahoo ticker). Add a row to add a stock.
-- `data.csv`: FY26 company numbers (₹ crore) for the Research tab.
+- `companies.csv`: all 40 companies by sector (name, Yahoo ticker, description). Used by Trade, Research and Learn. Add a row to add a company.
+- `data.csv`: hand-checked FY26 numbers (₹ crore) for six companies. Other companies' numbers are fetched automatically from Yahoo Finance.
 - `calc.py`: the ratio calculations.
 - `app.py`: the website.
 - `.streamlit/config.toml`: the black theme.
