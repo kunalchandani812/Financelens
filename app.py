@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 from calc import (NUMBERS, load_verified, add_ratios, pe_ratio, pb_ratio, START_CASH,
-                  new_portfolio, buy, sell, portfolio_value, holdings_table)
+                  new_portfolio, buy, sell, portfolio_value, holdings_table,
+                  review_trade, nifty_trend, position_in_range, now_ist, build_ai_prompt)
 
 try:
     import yfinance as yf
@@ -24,6 +25,7 @@ SECTORS = list(dict.fromkeys(companies["Sector"]))
 NAME_TO_TICKER = dict(zip(companies["Name"], companies["Ticker"]))
 NAME_TO_SECTOR = dict(zip(companies["Name"], companies["Sector"]))
 TICKERS = tuple(companies["Ticker"])
+QUOTE_TICKERS = TICKERS + ("^NSEI",)               # plus the Nifty 50 index, used to judge trades
 FINANCIAL = {"Banking", "Trading (capital markets)"}   # sectors where operating margin makes no sense
 
 RATIOS = {
@@ -173,7 +175,9 @@ def market_status():
     return is_open, now.strftime("%H:%M IST")
 
 
-def colour(v):  # green for gains, red for losses
+def colour(v):  # green for gains, red for losses (blank if there is no number)
+    if pd.isna(v):
+        return ""
     return "color:#00e676" if v > 0 else "color:#ff3b4e" if v < 0 else ""
 
 
@@ -186,11 +190,22 @@ def pct(x):
     return "n/a" if pd.isna(x) else f"{x * 100:.1f}%"
 
 
+def make_ctx(sector, pick, prices, quotes, price):
+    """Snapshot of the market at the moment of a trade, used later to review it."""
+    nifty = quotes["^NSEI"][0] if "^NSEI" in quotes else None
+    nifty_hist = get_history("^NSEI")
+    peers = {n: prices[n] for n in companies.loc[companies["Sector"] == sector, "Name"]
+             if prices.get(n) is not None}
+    return {"nifty": nifty, "sector": sector, "sector_prices": peers,
+            "nifty_trend": nifty_trend(nifty_hist, nifty),
+            "pos52": position_in_range(get_history(NAME_TO_TICKER[pick]), price)}
+
+
 # ---------------- live sections (they refresh themselves every 30 seconds) ----------------
 @st.fragment(run_every="30s")
 def live_summary():
     p = st.session_state.pf
-    prices = price_map(get_quotes(TICKERS))
+    prices = price_map(get_quotes(QUOTE_TICKERS))
     value = portfolio_value(p, prices)
     is_open, t = market_status()
     m1, m2, m3, m4 = st.columns(4)
@@ -203,7 +218,7 @@ def live_summary():
 @st.fragment(run_every="30s")
 def live_tables():
     p = st.session_state.pf
-    quotes = get_quotes(TICKERS)
+    quotes = get_quotes(QUOTE_TICKERS)
     prices = price_map(quotes)
 
     st.subheader("Your holdings")
@@ -232,7 +247,7 @@ def live_tables():
 
 
 def order_form():
-    quotes = get_quotes(TICKERS)
+    quotes = get_quotes(QUOTE_TICKERS)
     prices = price_map(quotes)
     if not any(v is not None for v in prices.values()):
         st.warning("Prices could not be loaded right now, so trading is paused. Try again in a minute.")
@@ -259,7 +274,8 @@ def order_form():
     bcol, scol, _ = st.columns([1, 1, 4])
     for label, action, col in (("Buy", buy, bcol), ("Sell", sell, scol)):
         if col.button(label, use_container_width=True):
-            err = action(st.session_state.pf, pick, qty, price, note)
+            ctx = make_ctx(sector, pick, prices, quotes, price)
+            err = action(st.session_state.pf, pick, qty, price, note, ctx)
             if err:
                 st.error(err)
             else:
@@ -267,12 +283,133 @@ def order_form():
                 st.rerun()
 
 
+
+# ---------------- AI explanation (optional: needs ANTHROPIC_API_KEY in Streamlit secrets) ----------------
+MAX_AI_PER_SESSION = 5   # explanations one visitor can request
+DAILY_AI_CAP = 100       # explanations the whole site will write per day
+
+
+def secret(name, default=None):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return default
+
+
+@st.cache_resource
+def ai_usage():  # one shared counter for all visitors (resets when the app restarts)
+    return {"day": None, "n": 0}
+
+
+def ai_allowed():
+    u, today = ai_usage(), now_ist().date().isoformat()
+    if u["day"] != today:
+        u["day"], u["n"] = today, 0
+    return u["n"] < DAILY_AI_CAP
+
+
+def ask_ai(trade, review):
+    """Ask Claude to explain one trade. Returns text, or None if anything goes wrong."""
+    try:
+        import anthropic
+        system, user = build_ai_prompt(trade, review)
+        client = anthropic.Anthropic(api_key=secret("ANTHROPIC_API_KEY"), timeout=30, max_retries=1)
+        msg = client.messages.create(model=secret("ANTHROPIC_MODEL", "claude-haiku-5-5"), max_tokens=350,
+                                     system=system, messages=[{"role": "user", "content": user}])
+        return "".join(b.text for b in msg.content if b.type == "text").strip() or None
+    except Exception:
+        return None
+
+
+def ai_box(i, trade, review):
+    store = st.session_state.setdefault("ai_text", {})
+    if i in store:
+        st.markdown(store[i]["text"])
+        st.caption(f"AI explanation written at {store[i]['at']} using the prices at that time.")
+        return
+    if not secret("ANTHROPIC_API_KEY"):
+        return  # AI is switched off: the automatic review above is all visitors see
+    if len(store) >= MAX_AI_PER_SESSION:
+        st.caption("You have used all your AI explanations for this visit.")
+        return
+    if st.button("Explain with AI", key=f"ai_btn_{i}"):
+        if not ai_allowed():
+            st.warning("The site's AI limit for today has been reached. Please try again tomorrow.")
+            return
+        with st.spinner("Writing the explanation..."):
+            text = ask_ai(trade, review)
+        if text:
+            ai_usage()["n"] += 1
+            store[i] = {"text": text, "at": now_ist().strftime("%H:%M")}
+            st.markdown(text)
+            st.caption(f"AI explanation written at {store[i]['at']} using the prices at that time.")
+        else:
+            st.error("The AI explanation is not available right now. The automatic review above still applies.")
+    else:
+        st.caption(f"Optional: a written explanation from AI ({MAX_AI_PER_SESSION - len(store)} left this visit).")
+
+
+def verdict_colour(v):
+    return ("color:#00e676;font-weight:700" if v == "Good call"
+            else "color:#ff3b4e;font-weight:700" if v == "Bad call" else "color:#ffb000")
+
+
+@st.fragment(run_every="30s")
+def review_section():
+    p = st.session_state.pf
+    trades = p["trades"]
+    if not trades:
+        st.info("Place a trade first. Every trade is reviewed here against the Nifty 50 and its sector.")
+        return
+    quotes = get_quotes(QUOTE_TICKERS)
+    prices = price_map(quotes)
+    now_nifty = quotes["^NSEI"][0] if "^NSEI" in quotes else None
+    now = now_ist()
+    reviews = [review_trade(t, prices, now_nifty, now) for t in trades]
+
+    first = next((t["_ctx"] for t in trades if t.get("_ctx") and t["_ctx"].get("nifty")), None)
+    port_ret = portfolio_value(p, prices) / START_CASH - 1
+    nifty_ret = now_nifty / first["nifty"] - 1 if first and now_nifty else None
+    judged = [r for r in reviews if r["Verdict"] in
+              ("Good call", "Bad call", "Market-driven gain", "Unlucky (market moved against it)")]
+    good = sum(r["Verdict"] == "Good call" for r in reviews)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Your portfolio since the start", f"{port_ret * 100:+.2f}%")
+    c2.metric("Nifty 50 since your first trade", f"{nifty_ret * 100:+.2f}%" if nifty_ret is not None else "n/a")
+    c3.metric("Good calls", f"{good} of {len(judged)}" if judged else "none judged yet")
+
+    rows = []
+    for t, r in zip(trades, reviews):
+        rows.append({"Time": t["Time"][11:16], "Action": t["Action"], "Stock": t["Company"],
+                     "Trade price": t["Price"], "Price now": prices.get(t["Company"]),
+                     "Held": r["Held"], "Stock move %": r["Stock move %"],
+                     "Nifty move %": r["Nifty move %"], "Sector move %": r["Sector move %"],
+                     "Edge vs Nifty (pts)": r["Edge vs Nifty (pts)"], "Verdict": r["Verdict"]})
+    table = pd.DataFrame(rows[::-1])
+    moves = ["Stock move %", "Nifty move %", "Sector move %", "Edge vs Nifty (pts)"]
+    st.dataframe(table.style.map(verdict_colour, subset=["Verdict"]).map(colour, subset=["Edge vs Nifty (pts)"])
+                 .format({"Trade price": "₹{:,.2f}", "Price now": "₹{:,.2f}",
+                          **{k: "{:+.2f}" for k in moves}}, na_rep="n/a"), hide_index=True)
+    st.caption("Edge vs Nifty = how much better (+) or worse (-) your decision did than the index. "
+               "For a sale, a fall after you sold counts as a good result.")
+
+    st.subheader("Why each trade got its verdict")
+    for i, (t, r) in reversed(list(enumerate(zip(trades, reviews)))):
+        with st.expander(f"{t['Time'][11:16]} · {t['Action']} {t['Company']}"):
+            st.write(f"**Verdict: {r['Verdict']}**")
+            st.write(r["Explanation"])
+            st.write(f"**Lesson:** {r['Lesson']}")
+            ai_box(i, t, r)
+    st.caption("This is an automatic review using price data, not news, and short holding periods are mostly noise. "
+               "A good result does not prove a good decision. Educational only, not investment advice.")
+
+
 # ---------------- page ----------------
 st.title("Finance🔍Lens")
 st.caption(f"Practice investing with ₹{START_CASH:,.0f} of fake money at real stock prices. "
            "Educational only, not investment advice.")
 
-tab1, tab2, tab3 = st.tabs(["Trade", "Research", "Learn"])
+tab1, tab_review, tab2, tab3 = st.tabs(["Trade", "Review", "Research", "Learn"])
 
 with tab1:
     if st.session_state.get("flash"):
@@ -283,7 +420,7 @@ with tab1:
     st.subheader("Trade history")
     trades = st.session_state.pf["trades"]
     if trades:
-        hist_df = pd.DataFrame(trades[::-1])
+        hist_df = pd.DataFrame(trades[::-1]).drop(columns=["_ctx"], errors="ignore")
         st.dataframe(hist_df, hide_index=True)
         st.download_button("Download trade history (CSV)", hist_df.to_csv(index=False), "trades.csv")
     else:
@@ -292,6 +429,9 @@ with tab1:
     if st.button("Reset practice account"):
         st.session_state.pf = new_portfolio()
         st.rerun()
+
+with tab_review:
+    review_section()
 
 with tab2:
     sector = st.selectbox("Sector", SECTORS, key="rs_sector")
@@ -357,6 +497,10 @@ with tab3:
     st.write("You start with fake cash and buy or sell whole shares at the latest price. "
              "Prices are real, so your profit or loss follows what the market actually does. "
              "Your holdings and total return update every 30 seconds.")
+    st.write("The Review tab compares each trade with the Nifty 50 and the other companies in its sector, "
+             "and labels it as a good call, a market-driven gain, bad luck or a bad call. "
+             + ("An optional AI explanation can describe the result in more detail, using only the price data."
+                if secret("ANTHROPIC_API_KEY") else ""))
     st.subheader("Key ratios")
     for key in RATIOS:
         with st.expander(key):
